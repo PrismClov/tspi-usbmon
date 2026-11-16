@@ -1,0 +1,3 @@
+# 插上泰山派 USB 副屏时自动加载 udisp_drm（可选，通常 modalias 已能自动加载）
+ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="2986", \
+    RUN+="/sbin/modprobe udisp_drm"

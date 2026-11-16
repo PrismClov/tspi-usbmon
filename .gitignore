@@ -1,0 +1,8 @@
+build/
+*.o
+*.ko
+.cache/
+
+# python
+__pycache__/
+*.pyc
