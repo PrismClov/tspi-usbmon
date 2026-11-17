@@ -133,11 +133,52 @@ echo "$UDC" > $G/UDC                   # 此时 adb 与副屏描述符都已就�
 **恢复顺序很重要**：`adbd` 在解绑时会退出并释放 FunctionFS 描述符，必须先重启 adbd、
 再绑定 UDC，否则 gadget 绑定失败、设备直接不枚举（会掉到需要拔插 USB 才能恢复）。
 
-### 还没解决的一环
+### 主机侧直通/权限
 
-宿主机是 VMware 里的 Ubuntu，USB 直通对**运行期重新枚举**不稳定：复合设备出现后很快
-被宿主侧断开（daemon 侧表现为随后收到 UNBIND，`usb` 变回 0），所以这个 VM 里没法完成
-“发帧 → 上屏”的最终验证。这不是设备端的问题，换到物理机直连应该就正常。
+VM 里实测两个坑，物理机直连一般不会遇到：
+
+1. **运行期重新枚举**时 VMware 直通会把设备丢掉；做法是让设备在开机时就以最终形态
+   绑定（S51 脚本），插上线后只枚举一次，就稳定了。
+2. 设备节点的 `uaccess` 不生效，adb 报 `no permissions`。加一条 udev 规则：
+   `SUBSYSTEM=="usb", ATTR{idVendor}=="303a", ATTR{idProduct}=="2986", MODE="0666"`。
+
+### 最终形态：开机即复合设备（deploy/S51usbdisplay）
+
+装好 `deploy/S51usbdisplay` 与 `deploy/tspi-usbmon.buildroot.conf` 后，开机流程变成：
+
+1. `S50usbdevice` 建 `rockchip` gadget（原样不动）；
+2. `S51usbdisplay` 解绑 UDC，把 `ffs.udisp` 链成 **f1**、`ffs.adb` 链成 f2
+   （保证主机侧 vendor 接口是 interface 0），并把 VID/PID 改成 `303a:2986`；
+3. 以 `attach=1` 启动 daemon（只写描述符、不绑定），等 `/tmp/tspi-usbmon.ready`；
+4. 重启 adbd（它会重写自己的描述符），然后绑定 UDC；
+5. 绑定失败时自动回退成「只有 adb」的原状，保证还能连上板子。
+
+实测结果（VM 里）：
+
+```
+# 板子
+09:00:29 composite bound (udisp + adb, 303a:2986)
+
+# 主机 lsusb
+Bus 002 Device 002: ID 303a:2986 rockchip rk3xxx
+
+# 接口布局
+intf 0: class=0xff sub=0x00 proto=0x00  ep 0x01(out)/0x81(in)   ← 视频
+intf 1: class=0x03 (HID)                 ep 0x82(in)            ← 触摸
+intf 2: class=0xff sub=0x42 proto=0x01   ep 0x02/0x83           ← adb
+
+# HID 被主机识别为触摸屏
+I: Bus=0003 Vendor=303a Product=2986
+N: Name="rockchip rk3xxx"
+H: Handlers=event6   PROP=2 (DIRECT)  ABS=3
+
+# 发帧
+host:  done: 93 frames in 10.0s (9.3 fps)
+board: usb=1 frames=70 (9.5 fps) failed=0 avg=69.2 ms 0.94 MB/s
+```
+
+15 fps 输入时：`frames=260 (14.1 fps) avg=55.6 ms`，CPU 1.8 GHz、温度 54 ℃，
+说明瓶颈在解码本身，不在降频。
 
 ## 下一步（按优先级）
 
