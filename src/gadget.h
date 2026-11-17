@@ -27,6 +27,10 @@ bool um_gadget_enabled(void);
 struct um_frame *um_gadget_wait_frame(int timeout_ms);
 void um_gadget_release_frame(struct um_frame *f);
 
+/* RX diagnostics: bytes read, valid headers, resyncs, dropped frames. */
+void um_gadget_rx_stats(unsigned long long *bytes, unsigned *headers, unsigned *rejects,
+                        unsigned *drops);
+
 /* Queue a HID report (52 bytes). Returns false when USB is not ready. */
 bool um_gadget_touch(const uint8_t *report, size_t len);
 

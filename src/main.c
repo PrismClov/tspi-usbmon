@@ -238,12 +238,18 @@ int main(int argc, char **argv)
         if (now - last_stats >= 5000) {
             uint64_t dt = now - last_stats;
 
-            um_info("usb=%d frames=%llu (%.1f fps) failed=%llu avg=%.1f ms %.2f MB/s",
+            unsigned long long rx_bytes = 0;
+            unsigned rx_hdr = 0, rx_rej = 0, rx_drop = 0;
+
+            um_gadget_rx_stats(&rx_bytes, &rx_hdr, &rx_rej, &rx_drop);
+            um_info("usb=%d frames=%llu (%.1f fps) failed=%llu avg=%.1f ms %.2f MB/s "
+                    "rx=%.1fMB hdr=%u rej=%u drop=%u",
                     um_gadget_enabled() ? 1 : 0, (unsigned long long)frames,
                     dt ? (double)stat_frames * 1000.0 / (double)dt : 0.0,
                     (unsigned long long)failed,
                     stat_frames ? (double)decode_us / 1000.0 / (double)stat_frames : 0.0,
-                    dt ? (double)bytes / 1048576.0 * 1000.0 / (double)dt : 0.0);
+                    dt ? (double)bytes / 1048576.0 * 1000.0 / (double)dt : 0.0,
+                    (double)rx_bytes / 1048576.0, rx_hdr, rx_rej, rx_drop);
             last_stats = now;
             stat_frames = 0;
             bytes = 0;

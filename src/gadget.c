@@ -67,6 +67,10 @@ static struct {
     struct slot slots[RX_SLOTS];
     unsigned seq;
     uint32_t limit;
+    atomic_ullong rx_bytes;
+    atomic_uint rx_headers;
+    atomic_uint rx_rejects;
+    atomic_uint rx_drops;
     char udc[64];
     uint8_t hid_desc[512];
     size_t hid_desc_len;
@@ -525,6 +529,8 @@ static void rx_feed(struct rx_state *st, const uint8_t *buf, size_t n)
 {
     size_t off = 0;
 
+    atomic_fetch_add(&g.rx_bytes, (unsigned long long)n);
+
     while (off < n) {
         if (st->cur == NULL && st->payload_left == 0 && st->discard_left == 0) {
             struct um_frame_hdr hdr;
@@ -533,13 +539,17 @@ static void rx_feed(struct rx_state *st, const uint8_t *buf, size_t n)
                 um_proto_scan(&st->proto, buf + off, n - off, &used, &hdr);
 
             off += used;
+            if (r == UM_PROTO_RESYNC)
+                atomic_fetch_add(&g.rx_rejects, 1);
             if (r != UM_PROTO_HEADER)
                 continue;
+            atomic_fetch_add(&g.rx_headers, 1);
             if (hdr.type == UM_TYPE_END)
                 continue;
             st->payload_left = hdr.payload;
             st->cur = slot_alloc((size_t)hdr.payload);
             if (!st->cur) {
+                atomic_fetch_add(&g.rx_drops, 1);
                 st->discard_left = st->payload_left;
                 st->payload_left = 0;
                 continue;
@@ -908,6 +918,19 @@ void um_gadget_stop(void)
     slots_free();
     pthread_mutex_destroy(&g.lock);
     pthread_cond_destroy(&g.cond);
+}
+
+void um_gadget_rx_stats(unsigned long long *bytes, unsigned *headers, unsigned *rejects,
+                        unsigned *drops)
+{
+    if (bytes)
+        *bytes = atomic_load(&g.rx_bytes);
+    if (headers)
+        *headers = atomic_load(&g.rx_headers);
+    if (rejects)
+        *rejects = atomic_load(&g.rx_rejects);
+    if (drops)
+        *drops = atomic_load(&g.rx_drops);
 }
 
 bool um_gadget_enabled(void)
