@@ -27,6 +27,7 @@ void um_config_defaults(struct um_config *cfg)
     snprintf(cfg->touch, sizeof(cfg->touch), "auto");
     snprintf(cfg->udc, sizeof(cfg->udc), "auto");
     cfg->takeover_udc = 0;
+    cfg->no_gadget = 0;
     cfg->vid = 0x303a;
     cfg->pid = 0x2986;
     snprintf(cfg->splash, sizeof(cfg->splash), "/usr/share/tspi-usbmon/splash.jpg");
@@ -125,6 +126,8 @@ int um_config_set(struct um_config *cfg, const char *kv)
         snprintf(cfg->udc, sizeof(cfg->udc), "%s", val);
     } else if (!strcmp(key, "takeover_udc")) {
         cfg->takeover_udc = atoi(val) ? 1 : 0;
+    } else if (!strcmp(key, "no_gadget")) {
+        cfg->no_gadget = atoi(val) ? 1 : 0;
     } else if (!strcmp(key, "product")) {
         snprintf(cfg->product, sizeof(cfg->product), "%s", val);
     } else if (!strcmp(key, "interface")) {

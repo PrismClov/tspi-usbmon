@@ -36,6 +36,9 @@ struct um_display {
     int back;
     int flip_done;
     int use_flip;
+    /* state saved at open so we can hand the CRTC back cleanly on exit */
+    int saved_valid;
+    drmModeCrtc *saved_crtc;
 };
 
 static const char *conn_type_name(uint32_t type)
@@ -155,28 +158,91 @@ static int pick_mode(struct um_display *d, drmModeConnector *c, const struct um_
     return 0;
 }
 
+/*
+ * Pick a CRTC for the connector.  A freshly re-opened panel often has
+ * encoder_id == 0 (the previous client disabled the CRTC), so walking
+ * res->crtcs[0] may land on VP0 while DSI is routed to VP1.  Prefer an
+ * already bound encoder, then an active CRTC, then any CRTC that the
+ * connector's encoders claim to support.
+ */
 static uint32_t find_crtc(struct um_display *d, drmModeRes *res, drmModeConnector *c)
 {
-    drmModeEncoder *enc;
     uint32_t crtc = 0;
+    drmModeEncoder *enc;
 
     enc = drmModeGetEncoder(d->fd, c->encoder_id);
     if (enc) {
-        if (enc->crtc_id) {
+        crtc = enc->crtc_id;
+        drmModeFreeEncoder(enc);
+    }
+
+    if (!crtc) {
+        for (int e = 0; e < c->count_encoders && !crtc; e++) {
+            enc = drmModeGetEncoder(d->fd, c->encoders[e]);
+            if (!enc)
+                continue;
             crtc = enc->crtc_id;
-        } else {
+            drmModeFreeEncoder(enc);
+        }
+    }
+
+    if (!crtc) {
+        for (int i = 0; i < res->count_crtcs; i++) {
+            drmModeCrtc *cc = drmModeGetCrtc(d->fd, res->crtcs[i]);
+
+            if (cc) {
+                if (cc->mode_valid)
+                    crtc = res->crtcs[i];
+                drmModeFreeCrtc(cc);
+            }
+            if (crtc)
+                break;
+        }
+    }
+
+    if (!crtc) {
+        for (int e = 0; e < c->count_encoders && !crtc; e++) {
+            enc = drmModeGetEncoder(d->fd, c->encoders[e]);
+            if (!enc)
+                continue;
             for (int i = 0; i < res->count_crtcs; i++) {
                 if (enc->possible_crtcs & (1u << i)) {
                     crtc = res->crtcs[i];
                     break;
                 }
             }
+            drmModeFreeEncoder(enc);
         }
-        drmModeFreeEncoder(enc);
     }
+
     if (!crtc && res->count_crtcs > 0)
         crtc = res->crtcs[0];
     return crtc;
+}
+
+/* Try the preferred CRTC first, then every other one (VOP routing differs). */
+static int set_crtc_any(struct um_display *d, drmModeRes *res, uint32_t preferred)
+{
+    uint32_t tried[16];
+    int ntried = 0;
+    int ret = -1;
+
+    if (preferred)
+        tried[ntried++] = preferred;
+    for (int i = 0; i < res->count_crtcs && ntried < (int)(sizeof(tried) / sizeof(tried[0])); i++) {
+        if (res->crtcs[i] != preferred)
+            tried[ntried++] = res->crtcs[i];
+    }
+
+    for (int i = 0; i < ntried; i++) {
+        if (drmModeSetCrtc(d->fd, tried[i], d->buf[0].fb, 0, 0, &d->conn, 1, &d->mode) == 0) {
+            if (i > 0)
+                um_warn("CRTC %u rejected, using %u instead", preferred, tried[i]);
+            d->crtc = tried[i];
+            return 0;
+        }
+    }
+    return ret;
 }
 
 static void destroy_buffers(struct um_display *d)
@@ -290,8 +356,11 @@ struct um_display *um_display_open(const struct um_config *cfg, int *panel_w, in
     if (create_buffers(d) < 0)
         goto fail;
 
-    if (drmModeSetCrtc(d->fd, d->crtc, d->buf[0].fb, 0, 0, &d->conn, 1, &d->mode) < 0) {
-        um_err("SetCrtc failed: %s", strerror(errno));
+    d->saved_crtc = drmModeGetCrtc(d->fd, d->crtc);
+    d->saved_valid = d->saved_crtc != NULL;
+
+    if (set_crtc_any(d, res, d->crtc) < 0) {
+        um_err("SetCrtc failed on every CRTC: %s", strerror(errno));
         goto fail;
     }
 
@@ -364,6 +433,19 @@ void um_display_close(struct um_display *d)
     if (!d)
         return;
     if (d->fd >= 0) {
+        /*
+         * Hand the CRTC back before destroying our buffers, otherwise the VOP
+         * keeps scanning a dead framebuffer and floods dmesg with
+         * POST_BUF_EMPTY errors.
+         */
+        if (d->saved_valid && d->saved_crtc->buffer_id) {
+            drmModeSetCrtc(d->fd, d->crtc, d->saved_crtc->buffer_id, d->saved_crtc->x,
+                           d->saved_crtc->y, &d->conn, 1, &d->saved_crtc->mode);
+        } else {
+            drmModeSetCrtc(d->fd, d->crtc, 0, 0, 0, NULL, 0, NULL);
+        }
+        if (d->saved_crtc)
+            drmModeFreeCrtc(d->saved_crtc);
         destroy_buffers(d);
         drmDropMaster(d->fd);
         close(d->fd);

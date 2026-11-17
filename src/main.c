@@ -178,7 +178,9 @@ int main(int argc, char **argv)
 
     splash = load_image(cfg.splash);
 
-    if (um_gadget_start(&cfg) < 0) {
+    if (cfg.no_gadget) {
+        um_warn("no_gadget=1: USB gadget disabled, display-only mode");
+    } else if (um_gadget_start(&cfg) < 0) {
         um_err("cannot start USB gadget");
         um_gadget_stop();
         goto out_geom;

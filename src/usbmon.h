@@ -73,6 +73,7 @@ struct um_config {
     /* gadget */
     char udc[64]; /* "auto" or UDC name */
     int takeover_udc; /* unbind another gadget (adbd) occupying the UDC */
+    int no_gadget;    /* skip USB gadget entirely (display-only bring-up) */
     char product[128];
     char interface[128];
     uint16_t vid;

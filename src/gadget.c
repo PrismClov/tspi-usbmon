@@ -186,6 +186,31 @@ static int bind_udc(const struct um_config *cfg)
     return -1;
 }
 
+static int udc_owner(const char *udc, char *out, size_t outlen);
+
+/* Unbind whichever gadget currently owns the UDC (e.g. the stock adb gadget). */
+static int takeover_udc(const char *udc)
+{
+    char owner[64];
+    char path[320];
+    char tmp[256];
+
+    if (!udc_owner(udc, owner, sizeof(owner)))
+        return 0;
+    if (!strcmp(owner, "tspi_udisp"))
+        return 0;
+
+    um_warn("UDC '%s' held by gadget '%s', unbinding it (takeover_udc=1)", udc, owner);
+    snprintf(path, sizeof(path), "/sys/kernel/config/usb_gadget/%s/UDC", owner);
+    snprintf(tmp, sizeof(tmp), "%s", owner);
+    if (write_str(path, "") < 0) {
+        um_err("cannot unbind gadget '%s'", tmp);
+        return -1;
+    }
+    sleep_ms(400);
+    return 0;
+}
+
 static void gadget_unbind(void)
 {
     char path[256];
@@ -202,6 +227,22 @@ static int gadget_configfs_init(const struct um_config *cfg)
 
     system("modprobe libcomposite 2>/dev/null");
     system("modprobe usb_f_fs 2>/dev/null");
+
+    /*
+     * Resolve the UDC first: on kernels with the vendor android_usb driver a
+     * new gadget can only be created once the stock gadget has been unbound,
+     * so the takeover has to happen before mkdir(GADGET_DIR).
+     */
+    snprintf(udc, sizeof(udc), "%s", cfg->udc);
+    if (!strcmp(udc, "auto") && read_udc_name(udc, sizeof(udc)) < 0) {
+        um_err("no UDC in /sys/class/udc (is dwc3 in peripheral mode?)");
+        return -1;
+    }
+    snprintf(g.udc, sizeof(g.udc), "%s", udc);
+    um_info("using UDC '%s'", g.udc);
+
+    if (cfg->takeover_udc && takeover_udc(g.udc) < 0)
+        return -1;
 
     if (mkdir_if_missing("/sys/kernel/config/usb_gadget") < 0) {
         um_err("configfs unavailable (mount -t configfs none /sys/kernel/config?)");
@@ -255,13 +296,6 @@ static int gadget_configfs_init(const struct um_config *cfg)
         return -1;
     }
 
-    snprintf(udc, sizeof(udc), "%s", cfg->udc);
-    if (!strcmp(udc, "auto") && read_udc_name(udc, sizeof(udc)) < 0) {
-        um_err("no UDC in /sys/class/udc (is dwc3 in peripheral mode?)");
-        return -1;
-    }
-    snprintf(g.udc, sizeof(g.udc), "%s", udc);
-    um_info("using UDC '%s'", g.udc);
     return 0;
 }
 
@@ -735,6 +769,9 @@ bool um_gadget_enabled(void)
 struct um_frame *um_gadget_wait_frame(int timeout_ms)
 {
     struct um_frame *out = NULL;
+
+    if (!atomic_load(&g.running))
+        return NULL;
     int best = -1;
     struct timespec deadline;
 
