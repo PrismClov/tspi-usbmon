@@ -23,9 +23,21 @@ if ! command -v gcc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; then
     apt-get install -y build-essential
 fi
 
+# Ubuntu 的内核头文件把 CC 写死成构建内核时用的那个 gcc（例如 gcc-12），
+# 和 build-essential 装的 gcc-11 不一样，必须按内核的要求补齐。
+KCC=$(sed -n 's/^CC[[:space:]]*=[[:space:]]*\$(CROSS_COMPILE)//p' \
+      "/lib/modules/$KREL/build/Makefile" 2>/dev/null | head -n1 | tr -d ' ')
+[ -n "$KCC" ] || KCC=gcc
+if ! command -v "$KCC" >/dev/null 2>&1; then
+    echo "==> 内核使用 $KCC，安装对应编译器"
+    apt-get update
+    apt-get install -y "$KCC"
+fi
+echo "==> 使用编译器 $KCC"
+
 echo "==> 编译 udisp_drm"
 make -C "$HERE/udisp_drm" clean >/dev/null 2>&1 || true
-make -C "$HERE/udisp_drm"
+make -C "$HERE/udisp_drm" CC="$KCC"
 
 echo "==> 安装模块与 modprobe 配置"
 make -C "$HERE/udisp_drm" install
