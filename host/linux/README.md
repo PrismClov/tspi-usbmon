@@ -18,6 +18,16 @@ sudo ./setup-udisp-driver.sh
 
 安装脚本会把 `udisp_drm.ko` 放到 `/lib/modules/$(uname -r)/extra/` 并执行 `depmod`。
 
+### 本地补丁（相对上游）
+
+`udisp_drm/src/udisp_drm_usb.c` 带两处针对 1080×2160 大帧的修改，已在文件里用
+`Local patch (tspi-usbmon)` 注释标出：
+
+1. **TX 槽自动降级**：设备上报的 `Bl` 是 4 MiB 时，上游会 `kmalloc` 4 个 4 MiB 缓冲区，
+   在碎片化的系统上 probe 直接 `-ENOMEM`。现在按 2 的幂递减到能分配成功的大小，并把
+   `frame_limit` 同步收紧（编码器会自动降质量，不会产生发不出去的帧）。
+2. **旋转暂存改 `vmalloc`**：该缓冲只做 CPU 侧拼图、不参与 DMA，避免高 order `kmalloc` 失败。
+
 ## 2. 加载参数
 
 设备原生是 **竖屏 1080×2160**，Linux 驱动默认 `rotate=90`，即：

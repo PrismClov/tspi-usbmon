@@ -1,0 +1,1 @@
+savedcmd_/home/clover/Documents/deepseek-harness/default-workspace/tspi-usbmon/host/linux/udisp_drm/udisp_drm.o := ld -m elf_x86_64 -z noexecstack   -r -o /home/clover/Documents/deepseek-harness/default-workspace/tspi-usbmon/host/linux/udisp_drm/udisp_drm.o @/home/clover/Documents/deepseek-harness/default-workspace/tspi-usbmon/host/linux/udisp_drm/udisp_drm.mod 

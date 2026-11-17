@@ -1251,7 +1251,7 @@ static void udisp_drm_release(struct drm_device *drm, void *ptr)
 	}
 	kfree(ud->last_tx_buf);
 	ud->last_tx_buf = NULL;
-	kfree(ud->rotate_buf);
+	vfree(ud->rotate_buf);
 	ud->rotate_buf = NULL;
 	kfree(ud->line_buf);
 }
@@ -1303,11 +1303,28 @@ static int udisp_drm_init(struct udisp_device *ud)
 	transfer_len = sizeof(struct udisp_frame_header) + min_t(size_t, ud->frame_limit, UDISP_MAX_TRANSFER - sizeof(struct udisp_frame_header));
 	ud->tx_buf_size = min_t(size_t, transfer_len, UDISP_MAX_TRANSFER);
 	ud->jpg_src_size = ud->jpg_width * ud->jpg_height * 3;
+	/*
+	 * Local patch (tspi-usbmon): a 4 MiB Bl value asks for four multi-MB
+	 * kmalloc() buffers, which fails with -ENOMEM on fragmented systems and
+	 * makes probe fail.  Halve the slot size until the allocation succeeds
+	 * and shrink frame_limit accordingly so the encoder never produces a
+	 * frame that cannot be transmitted.
+	 */
 	for (i = 0; i < UDISP_RING_SLOTS; i++) {
-		ud->slots[i].tx_buf = kmalloc(ud->tx_buf_size, GFP_KERNEL);
+		size_t try = ud->tx_buf_size;
+
+		while (!(ud->slots[i].tx_buf = kmalloc(try, GFP_KERNEL)) && try > 65536)
+			try /= 2;
 		if (!ud->slots[i].tx_buf) {
 			ret = -ENOMEM;
 			goto err_put;
+		}
+		if (i == 0 && try < ud->tx_buf_size) {
+			dev_warn(&ud->intf->dev,
+				 "tx slot reduced to %zu bytes (probe memory pressure)\n", try);
+			ud->tx_buf_size = try;
+			if (ud->frame_limit > try - sizeof(struct udisp_frame_header))
+				ud->frame_limit = try - sizeof(struct udisp_frame_header);
 		}
 		ud->slots[i].jpg_src = vmalloc(ud->jpg_src_size);
 		if (!ud->slots[i].jpg_src) {
@@ -1328,7 +1345,9 @@ static int udisp_drm_init(struct udisp_device *ud)
 	}
 	ud->rotate_buf_size = UDISP_ROTATE_TILE_ROWS *
 		max_t(size_t, ud->host_width, ud->host_height) * 4;
-	ud->rotate_buf = kmalloc(ud->rotate_buf_size, GFP_KERNEL);
+	/* CPU-side staging buffer, never DMA-mapped: vmalloc avoids high-order
+	 * kmalloc failures on 1080x2160 setups. */
+	ud->rotate_buf = vmalloc(ud->rotate_buf_size);
 	if (!ud->rotate_buf) {
 		ret = -ENOMEM;
 		goto err_put;
