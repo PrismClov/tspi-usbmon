@@ -12,7 +12,9 @@
 #define _GNU_SOURCE
 #include "gadget.h"
 
+#include <arpa/inet.h>
 #include <dirent.h>
+#include <netinet/in.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/usb/ch9.h>
@@ -24,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -50,6 +53,9 @@ static struct {
     int ep0_fd;
     int ep1_fd;
     int ep3_fd;
+    int listen_fd;
+    int client_fd;
+    int tcp_port;
     pthread_t ep0_thread;
     pthread_t rx_thread;
     int ep0_started;
@@ -432,6 +438,25 @@ static int ffs_write_descriptors(const struct um_config *cfg)
     return 0;
 }
 
+/*
+ * Mount FunctionFS and hand our descriptors to the kernel.  Must happen before
+ * the gadget is bound to the UDC.
+ */
+static int ffs_prepare(const struct um_config *cfg)
+{
+    mkdir_if_missing(FFS_MOUNT);
+    if (mount(FFS_INSTANCE, FFS_MOUNT, "functionfs", 0, NULL) < 0 && errno != EBUSY) {
+        um_err("cannot mount functionfs: %s", strerror(errno));
+        return -1;
+    }
+    g.ep0_fd = open(FFS_MOUNT "/ep0", O_RDWR | O_CLOEXEC);
+    if (g.ep0_fd < 0) {
+        um_err("open ep0: %s", strerror(errno));
+        return -1;
+    }
+    return ffs_write_descriptors(cfg);
+}
+
 /* ------------------------------------------------------------ frame slots */
 
 static void slots_init(void)
@@ -480,25 +505,89 @@ static void slot_push(struct slot *s)
 
 /* --------------------------------------------------------------- readers */
 
+struct rx_state {
+    struct um_proto proto;
+    struct slot *cur;
+    size_t payload_left;
+    size_t discard_left;
+};
+
+static void rx_reset(struct rx_state *st)
+{
+    um_proto_reset(&st->proto);
+    st->cur = NULL;
+    st->payload_left = 0;
+    st->discard_left = 0;
+}
+
+/* Feed one chunk of the host byte stream into the frame ring. */
+static void rx_feed(struct rx_state *st, const uint8_t *buf, size_t n)
+{
+    size_t off = 0;
+
+    while (off < n) {
+        if (st->cur == NULL && st->payload_left == 0 && st->discard_left == 0) {
+            struct um_frame_hdr hdr;
+            size_t used = 0;
+            enum um_proto_result r =
+                um_proto_scan(&st->proto, buf + off, n - off, &used, &hdr);
+
+            off += used;
+            if (r != UM_PROTO_HEADER)
+                continue;
+            if (hdr.type == UM_TYPE_END)
+                continue;
+            st->payload_left = hdr.payload;
+            st->cur = slot_alloc((size_t)hdr.payload);
+            if (!st->cur) {
+                st->discard_left = st->payload_left;
+                st->payload_left = 0;
+                continue;
+            }
+            st->cur->w = hdr.width;
+            st->cur->h = hdr.height;
+            st->cur->id = hdr.id;
+            st->cur->len = 0;
+        } else if (st->cur) {
+            size_t take = st->payload_left;
+            size_t avail = n - off;
+
+            if (take > avail)
+                take = avail;
+            memcpy(st->cur->data + st->cur->len, buf + off, take);
+            st->cur->len += take;
+            off += take;
+            st->payload_left -= take;
+            if (st->payload_left == 0) {
+                if (st->cur->len > 0)
+                    slot_push(st->cur);
+                st->cur = NULL;
+            }
+        } else {
+            size_t take = st->discard_left;
+            size_t avail = n - off;
+
+            if (take > avail)
+                take = avail;
+            off += take;
+            st->discard_left -= take;
+        }
+    }
+}
+
 static void *rx_thread(void *arg)
 {
     static uint8_t buf[RX_CHUNK];
-    struct um_proto proto;
-    struct um_frame_hdr hdr;
-    struct slot *cur = NULL;
-    size_t payload_left = 0;
-    size_t discard_left = 0;
+    struct rx_state st;
 
     (void)arg;
-    um_proto_init(&proto, g.limit);
+    memset(&st, 0, sizeof(st));
+    um_proto_init(&st.proto, g.limit);
 
     while (atomic_load(&g.running)) {
         if (!atomic_load(&g.enabled)) {
             close_ep(&g.ep1_fd);
-            um_proto_reset(&proto);
-            cur = NULL;
-            payload_left = 0;
-            discard_left = 0;
+            rx_reset(&st);
             sleep_ms(50);
             continue;
         }
@@ -534,58 +623,89 @@ static void *rx_thread(void *arg)
         if (n == 0)
             continue;
 
-        size_t off = 0;
-
-        while (off < (size_t)n) {
-            if (cur == NULL && payload_left == 0 && discard_left == 0) {
-                size_t used = 0;
-                enum um_proto_result r =
-                    um_proto_scan(&proto, buf + off, (size_t)n - off, &used, &hdr);
-
-                off += used;
-                if (r == UM_PROTO_HEADER) {
-                    if (hdr.type == UM_TYPE_END)
-                        continue;
-                    payload_left = hdr.payload;
-                    cur = slot_alloc((size_t)hdr.payload);
-                    if (!cur) {
-                        discard_left = payload_left;
-                        payload_left = 0;
-                        continue;
-                    }
-                    cur->w = hdr.width;
-                    cur->h = hdr.height;
-                    cur->id = hdr.id;
-                    cur->len = 0;
-                }
-            } else if (cur) {
-                size_t take = payload_left;
-                size_t avail = (size_t)n - off;
-
-                if (take > avail)
-                    take = avail;
-                memcpy(cur->data + cur->len, buf + off, take);
-                cur->len += take;
-                off += take;
-                payload_left -= take;
-                if (payload_left == 0) {
-                    if (cur->len > 0)
-                        slot_push(cur);
-                    cur = NULL;
-                }
-            } else {
-                size_t take = discard_left;
-                size_t avail = (size_t)n - off;
-
-                if (take > avail)
-                    take = avail;
-                off += take;
-                discard_left -= take;
-            }
-        }
+        rx_feed(&st, buf, (size_t)n);
     }
 
     close_ep(&g.ep1_fd);
+    return NULL;
+}
+
+/* ------------------------------------------------- TCP frame input (debug) */
+
+static int tcp_listen(int port)
+{
+    struct sockaddr_in addr;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int one = 1;
+
+    if (fd < 0)
+        return -1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(fd, 1) < 0) {
+        um_err("TCP listen on %d failed: %s", port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/*
+ * Debug/bench path: the host sends the same 16-byte header + JPEG frames over
+ * 127.0.0.1 (typically through `adb forward`).  Useful when the USB gadget is
+ * unavailable or to validate the decode/display pipeline in isolation.
+ */
+static void *tcp_rx_thread(void *arg)
+{
+    static uint8_t buf[RX_CHUNK];
+    struct rx_state st;
+
+    (void)arg;
+    memset(&st, 0, sizeof(st));
+    um_proto_init(&st.proto, g.limit);
+
+    while (atomic_load(&g.running)) {
+        if (g.client_fd < 0) {
+            struct pollfd pfd = {.fd = g.listen_fd, .events = POLLIN};
+            int c;
+
+            if (poll(&pfd, 1, 300) <= 0)
+                continue;
+            c = accept(g.listen_fd, NULL, NULL);
+            if (c >= 0) {
+                g.client_fd = c;
+                rx_reset(&st);
+                atomic_store(&g.enabled, true);
+                um_info("TCP frame client connected");
+            }
+            continue;
+        }
+
+        struct pollfd pfd = {.fd = g.client_fd, .events = POLLIN};
+        int pr = poll(&pfd, 1, 300);
+
+        if (pr <= 0)
+            continue;
+
+        ssize_t n = read(g.client_fd, buf, sizeof(buf));
+
+        if (n <= 0) {
+            um_info("TCP frame client disconnected");
+            close(g.client_fd);
+            g.client_fd = -1;
+            atomic_store(&g.enabled, false);
+            rx_reset(&st);
+            continue;
+        }
+        rx_feed(&st, buf, (size_t)n);
+    }
+
+    if (g.client_fd >= 0)
+        close(g.client_fd);
     return NULL;
 }
 
@@ -707,23 +827,14 @@ int um_gadget_start(const struct um_config *cfg)
 {
     memset(&g, 0, sizeof(g));
     g.ep0_fd = g.ep1_fd = g.ep3_fd = -1;
+    g.listen_fd = g.client_fd = -1;
+    g.tcp_port = cfg->tcp_port;
     g.cfg = cfg;
     g.limit = cfg->max_frame;
     pthread_mutex_init(&g.lock, NULL);
     pthread_cond_init(&g.cond, NULL);
     atomic_store(&g.running, true);
     atomic_store(&g.enabled, false);
-
-    if (gadget_configfs_init(cfg) < 0)
-        return -1;
-
-    g.ep0_fd = open(FFS_MOUNT "/ep0", O_RDWR | O_CLOEXEC);
-    if (g.ep0_fd < 0) {
-        um_err("open ep0: %s", strerror(errno));
-        return -1;
-    }
-    if (ffs_write_descriptors(cfg) < 0)
-        return -1;
 
     slots_init();
     for (int i = 0; i < RX_SLOTS; i++) {
@@ -733,6 +844,42 @@ int um_gadget_start(const struct um_config *cfg)
             return -1;
         }
     }
+
+    if (g.tcp_port > 0) {
+        g.listen_fd = tcp_listen(g.tcp_port);
+        if (g.listen_fd < 0)
+            return -1;
+        um_info("TCP frame input on 127.0.0.1:%d", g.tcp_port);
+        g.rx_started = pthread_create(&g.rx_thread, NULL, tcp_rx_thread, NULL) == 0;
+        return g.rx_started ? 0 : -1;
+    }
+
+    if (cfg->attach) {
+        /*
+         * Attach mode: ffs.udisp already exists in an existing gadget and the
+         * UDC is not bound yet.  We only write descriptors; the caller binds
+         * the UDC afterwards (some vendor kernels cannot create new gadgets).
+         */
+        if (ffs_prepare(cfg) < 0)
+            return -1;
+        g.ep0_started = pthread_create(&g.ep0_thread, NULL, ep0_thread, NULL) == 0;
+        g.rx_started = pthread_create(&g.rx_thread, NULL, rx_thread, NULL) == 0;
+        um_info("attach mode: descriptors written, waiting for external bind");
+        {
+            int fd = open("/tmp/tspi-usbmon.ready", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                (void)write(fd, "ready\n", 6);
+                close(fd);
+            }
+        }
+        return (g.ep0_started && g.rx_started) ? 0 : -1;
+    }
+
+    if (gadget_configfs_init(cfg) < 0)
+        return -1;
+
+    if (ffs_prepare(cfg) < 0)
+        return -1;
 
     g.ep0_started = pthread_create(&g.ep0_thread, NULL, ep0_thread, NULL) == 0;
     g.rx_started = pthread_create(&g.rx_thread, NULL, rx_thread, NULL) == 0;
@@ -756,6 +903,8 @@ void um_gadget_stop(void)
     close_ep(&g.ep1_fd);
     close_ep(&g.ep3_fd);
     close_ep(&g.ep0_fd);
+    close_ep(&g.listen_fd);
+    close_ep(&g.client_fd);
     slots_free();
     pthread_mutex_destroy(&g.lock);
     pthread_cond_destroy(&g.cond);
@@ -834,6 +983,16 @@ bool um_gadget_touch(const uint8_t *report, size_t len)
 {
     if (!atomic_load(&g.enabled))
         return false;
+
+    if (g.tcp_port > 0) {
+        uint8_t hdr[4] = {'T', 'C', (uint8_t)(len & 0xff), (uint8_t)(len >> 8)};
+
+        if (g.client_fd < 0)
+            return false;
+        if (write(g.client_fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr))
+            return false;
+        return write(g.client_fd, report, len) == (ssize_t)len;
+    }
     if (g.ep3_fd < 0) {
         g.ep3_fd = open(FFS_MOUNT "/ep3", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
         if (g.ep3_fd < 0)

@@ -28,6 +28,8 @@ void um_config_defaults(struct um_config *cfg)
     snprintf(cfg->udc, sizeof(cfg->udc), "auto");
     cfg->takeover_udc = 0;
     cfg->no_gadget = 0;
+    cfg->tcp_port = 0;
+    cfg->attach = 0;
     cfg->vid = 0x303a;
     cfg->pid = 0x2986;
     snprintf(cfg->splash, sizeof(cfg->splash), "/usr/share/tspi-usbmon/splash.jpg");
@@ -128,6 +130,14 @@ int um_config_set(struct um_config *cfg, const char *kv)
         cfg->takeover_udc = atoi(val) ? 1 : 0;
     } else if (!strcmp(key, "no_gadget")) {
         cfg->no_gadget = atoi(val) ? 1 : 0;
+    } else if (!strcmp(key, "attach")) {
+        cfg->attach = atoi(val) ? 1 : 0;
+    } else if (!strcmp(key, "tcp_port")) {
+        int v = atoi(val);
+
+        if (v < 0 || v > 65535)
+            return -1;
+        cfg->tcp_port = v;
     } else if (!strcmp(key, "product")) {
         snprintf(cfg->product, sizeof(cfg->product), "%s", val);
     } else if (!strcmp(key, "interface")) {

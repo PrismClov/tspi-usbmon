@@ -82,6 +82,7 @@ journalctl -u tspi-usbmon -f      # 设备端应有 usb=1 frames=... fps
 | [06 性能与调优](docs/06-performance.md) | 带宽/解码预算、参数怎么调 |
 | [07 故障排查](docs/07-troubleshooting.md) | 黑屏、不枚举、触摸错位 |
 | [08 备选方案](docs/08-alternatives.md) | USB 网卡 + 远程桌面、ESP32-P4 参考方案 |
+| [09 Buildroot 实测](docs/09-buildroot-bringup.md) | 泰山派 Buildroot 镜像上的实测、android_usb 限制、attach 模式 |
 
 ## 目录结构
 

@@ -74,6 +74,8 @@ struct um_config {
     char udc[64]; /* "auto" or UDC name */
     int takeover_udc; /* unbind another gadget (adbd) occupying the UDC */
     int no_gadget;    /* skip USB gadget entirely (display-only bring-up) */
+    int tcp_port;     /* >0: read frames from 127.0.0.1:<port> instead of USB */
+    int attach;       /* attach to an existing configfs gadget (no bind) */
     char product[128];
     char interface[128];
     uint16_t vid;
