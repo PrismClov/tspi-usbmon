@@ -5,15 +5,16 @@ Linux 主机使用 [panyihang/USB-DRM-udisp-driver](https://github.com/panyihang
 
 ## 1. 安装驱动
 
-需要与当前内核匹配的头文件：
+本仓库已内置驱动源码（`udisp_drm/`，来自
+[panyihang/USB-DRM-udisp-driver](https://github.com/panyihang/USB-DRM-udisp-driver)，GPL-2.0），
+一条命令完成编译 + 安装 + 加载：
 
 ```bash
-sudo apt install -y build-essential linux-headers-$(uname -r) git
-git clone https://github.com/panyihang/USB-DRM-udisp-driver.git
-cd USB-DRM-udisp-driver
-make
-sudo make install
+sudo ./setup-udisp-driver.sh
 ```
+
+脚本会自动装 `linux-headers-$(uname -r)` 和 `build-essential`（如果缺），
+编译 `udisp_drm.ko`、安装 modprobe 配置并加载。
 
 安装脚本会把 `udisp_drm.ko` 放到 `/lib/modules/$(uname -r)/extra/` 并执行 `depmod`。
 
