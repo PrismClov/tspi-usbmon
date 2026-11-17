@@ -30,6 +30,9 @@ bind_composite() {
     ln -s $G/functions/ffs.adb    $G/configs/b.1/f2
     echo 0x303a > $G/idVendor
     echo 0x2986 > $G/idProduct
+    # Windows IDD 驱动从 **product 字符串** 解析分辨率/编码/帧率，
+    # 默认的 "rk3xxx" 不含 R/Ejpg/Fps/Bl，驱动会拿不到 1080x2160。
+    echo "tspi_R1080x2160_Ejpg6_Fps30_Bl4194304" > $G/strings/0x409/product
 
     mkdir -p $FFS
     mountpoint -q $FFS || mount -t functionfs udisp $FFS
