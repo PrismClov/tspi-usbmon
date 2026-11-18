@@ -10,17 +10,17 @@
 * **Windows**：官方签名 IDD 驱动（`303a:2986`），装完即用；
 * **Linux**：`udisp_drm.ko`，标准 DRM/KMS 显示器，GNOME/KDE/Sway/X11 直接识别。
 
-设备端则是全新实现：Linux + FunctionFS + libjpeg-turbo + DRM/KMS，直接驱动
-1080×2160 MIPI-DSI 面板，不经过 LVGL，也不占用 GPU。
+设备端通过 FunctionFS 接收逐帧 JPEG。RK3566 加速构建使用 MPP 硬解和 RGA
+旋转缩放，通用构建使用 libjpeg-turbo 软件解码。两者均通过 DRM/KMS 驱动 1080×2160 MIPI-DSI 面板。
 
 ```
 ┌──────────────┐   USB 2.0 HS (bulk)   ┌───────────────────────────────┐
 │  Windows IDD │ ──── JPEG 帧 + 帧头 ──▶│ FunctionFS  ffs.udisp          │
-│  或 Linux    │                        │  ep1 OUT ──▶ 帧重组 ──▶ turbojpeg│
+│  或 Linux    │                        │  ep1 OUT ──▶ 帧重组 ──▶ JPEG 解码│
 │  udisp_drm   │ ◀── HID 触摸报告 ───── │  ep3 IN  ◀── 触摸映射           │
 └──────────────┘                        │            │                   │
                                         │            ▼                   │
-                                        │  DRM/KMS 双缓冲 page flip      │
+                                        │  DRM/KMS 三缓冲 page flip      │
                                         │            │                   │
                                         │  MIPI-DSI1 4 lane 1080×2160    │
                                         └───────────────────────────────┘
@@ -90,9 +90,9 @@ journalctl -u tspi-usbmon -f      # 设备端应有 usb=1 frames=... fps
 src/                设备端守护进程
   gadget.c          configfs + FunctionFS，收帧 / 发 HID
   proto.c           16 字节帧头解析与重同步
-  jpegdec.c         libjpeg-turbo 解码到 BGRX
+  jpegdec.c         MPP 硬解到 DMA-BUF，或 libjpeg-turbo 解码到 BGRX
   geom.c            旋转 / 缩放 / 黑边 / 触摸逆映射
-  display.c         DRM/KMS 双缓冲 page flip
+  display.c         DRM/KMS 三缓冲 page flip
   touch.c           evdev 多点触摸 → HID 报告
 kernel/dts/         天马屏 DTS（替换 SDK 的 dsi dtsi）
 kernel/configs/     内核配置片段
@@ -120,16 +120,20 @@ tests/              协议、HID、几何、合成的单元测试
 * 内核 DTS 基于 [mipi-hub](https://gitee.com/opengisbook/mipi-hub-official) 中已被
   验证过的泰山派适配（作者 sigmenx），本项目修掉了其中 `brightness-levels`
   的语法错误并显式设置 `dr_mode = "peripheral"`。
-* 本仓库在无硬件的环境下开发，**尚未在实机上跑通全流程**；首次点亮请按
-  [07 故障排查](docs/07-troubleshooting.md) 逐项确认，尤其是供电、FPC 方向和
-  `dr_mode`。
+* Windows 主机连接 RK3566 的 USB 副屏已在实机验证。首次点亮可参考[故障排查](docs/07-troubleshooting.md)。
+
+## 解码规格与副屏实测
+
+瑞芯微为 RK3566 标注的 **4K@60 fps 视频解码**适用于 H.265、H.264 和 VP9。
+该项规格没有给出逐帧 JPEG 的帧率。[瑞芯微 RK3566 产品页](https://www.rock-chips.com/a/cn/product/RK35xilie/2021/0113/1273.html)
+
+本项目通过 USB 2.0 Bulk 传输逐帧 JPEG。在 Windows 提前通知驱动、1920×1080 输入、
+JPEG 质量 70 的动态画面测试中，副屏在连续 60 秒内实际呈现了 3,323 张不同画面，
+平均 **55.38 fps**，逐秒为 **46～60 fps**。这里按面板翻转完成计数，包含从主机供帧到显示的整条链路。[实测方法与结果](docs/06-performance.md)
 
 ## 已知限制
 
-* **1080×2160@30 已接近 RK3566 的 JPEG 解码上限**，想要更高帧率请把 `stream` 降到
-  `720x1440`（设备端放大）或降低 `jpeg_quality`；
-* **Windows 横放需要改配置**（`stream=2160x1080` `rotate=90` `host_rotate=0`），
-  默认配置是给 Linux 主机用的；
+* Windows 横放实测配置为 `stream=1920x1080`、`rotate=90`、`host_rotate=0`，见 [1080p 配置](deploy/1080p60/tspi-usbmon.conf)。
 * 必须重新编译内核（面板 DTS + 触摸驱动 + gadget 配置），不能只装应用；
 * 官方镜像的 **adb 会占用 UDC**，需要先停掉或设置 `takeover_udc = 1`；
 * **供电**：PC 单个 USB 口通常不够，强烈建议带电源 HUB / 外接 5V；
