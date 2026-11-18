@@ -1,0 +1,198 @@
+--- a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.cpp
++++ b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.cpp
+@@ -550,7 +550,7 @@
+ #endif
+ 
+ 
+-int enc_grab_surface( std::shared_ptr<Direct3DDevice> m_Device,ComPtr<IDXGIResource> AcquiredBuffer, uint8_t *fb_buf,D3D11_TEXTURE2D_DESC *);
++int enc_grab_surface( std::shared_ptr<Direct3DDevice> m_Device,ComPtr<IDXGIResource> AcquiredBuffer, uint8_t *fb_buf,D3D11_TEXTURE2D_DESC *, IDDCX_SWAPCHAIN, bool&, HRESULT&);
+ 
+ void SwapChainProcessor::RunCore()
+ {
+@@ -602,6 +602,8 @@
+                 break;
+             }
+         } else if(SUCCEEDED(hr)) {
++            bool notified=false;
++            HRESULT notifyStatus=S_OK;
+             AcquiredBuffer.Attach(Buffer.MetaData.pSurface);
+ 
+             // ==============================
+@@ -637,7 +639,10 @@
+ 					if(NULL != purb) 
+ 					{
+ 						a=get_system_us();
+-						enc_grab_surface(m_Device , AcquiredBuffer , this->fb_buf ,&frameDescriptor);
++						if (FAILED(enc_grab_surface(m_Device, AcquiredBuffer, fb_buf, &frameDescriptor, m_hSwapChain, notified, notifyStatus))) {
++                            InterlockedPushEntrySList(&urb_list, &purb->node);
++                            goto next;
++                        }
+ #if 1
+ 						if(pContext->w*2 == frameDescriptor.Width) {
+ 							LOGD("scale...%d to %d \n",frameDescriptor.Width,pContext->w);
+@@ -654,7 +659,11 @@
+ 						total_bytes+=sizeof(udisp_frame_header_t);
+ 
+ 						#if 1
+-						LOGD("issue urb id:%d \n",purb->id);
++						LOGM("FRAME wire=%u windows=%u dirty=%u move=%u bytes=%d\n",
++                             (unsigned)((udisp_frame_header_t*)purb->urb_msg)->frame_id,
++                             Buffer.MetaData.PresentationFrameNumber, Buffer.MetaData.DirtyRectCount,
++                             Buffer.MetaData.MoveRegionCount,total_bytes);
++                        LOGD("issue urb id:%d \n",purb->id);
+ 						NTSTATUS ret = usb_send_msg_async(purb, pContext->BulkWritePipe, purb->Request, purb->urb_msg, total_bytes);
+ 						if((total_bytes % pContext->max_out_pkg_size) ==0){
+ 							pentry =  InterlockedPopEntrySList(&urb_list);
+@@ -690,7 +699,7 @@
+ next:
+ 			t=get_system_us();
+             AcquiredBuffer.Reset();
+-            hr = IddCxSwapChainFinishedProcessingFrame(m_hSwapChain);
++            hr = notified ? notifyStatus : IddCxSwapChainFinishedProcessingFrame(m_hSwapChain);
+             if(FAILED(hr)) {
+                 break;
+             }
+@@ -1072,96 +1081,43 @@
+ 
+ 
+ 
+-int enc_grab_surface( std::shared_ptr<Direct3DDevice> m_Device,ComPtr<IDXGIResource> AcquiredBuffer, uint8_t *fb_buf, D3D11_TEXTURE2D_DESC * pframeDescriptor){
+-    HRESULT hr;
+-#define RESET_OBJECT(obj) { if(obj) obj->Release(); obj = NULL; }
+-            ID3D11Texture2D *hAcquiredDesktopImage = NULL;
+-            hr = AcquiredBuffer->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&hAcquiredDesktopImage));
+-            if(FAILED(hr)) {
+-                LOGE("dxgi 2d NG\n");
+-                goto next;
+-            }
+-
+-            // copy old description
+-            //
+-            D3D11_TEXTURE2D_DESC frameDescriptor;
+-            hAcquiredDesktopImage->GetDesc(&frameDescriptor);
+-
+-
+-            //
+-            // create a new staging buffer for cpu accessable, or only GPU can access
+-            //
+-            ID3D11Texture2D *hNewDesktopImage = NULL;
+-            frameDescriptor.Usage = D3D11_USAGE_STAGING;
+-            frameDescriptor.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+-            frameDescriptor.BindFlags = 0;
+-            frameDescriptor.MiscFlags = 0;
+-            frameDescriptor.MipLevels = 1;
+-            frameDescriptor.ArraySize = 1;
+-            frameDescriptor.SampleDesc.Count = 1;
+-            *pframeDescriptor = frameDescriptor;
+-			//LOGI("%s %d %d %d\n",__func__,__LINE__,frameDescriptor.Width,frameDescriptor.Height);
+-            hr = m_Device->Device->CreateTexture2D(&frameDescriptor, NULL, &hNewDesktopImage);
+-            if(FAILED(hr)) {
+-                RESET_OBJECT(hAcquiredDesktopImage);
+-
+-                LOGE("dxgi create 2d NG\n");
+-                goto next;
+-            }
+-
+-            //
+-            // copy next staging buffer to new staging buffer
+-            //
+-            m_Device->DeviceContext->CopyResource(hNewDesktopImage, hAcquiredDesktopImage);
+-
+-
+-            //
+-            // create staging buffer for map bits
+-            //
+-            IDXGISurface *hStagingSurf = NULL;
+-            hr = hNewDesktopImage->QueryInterface(__uuidof(IDXGISurface), (void **)(&hStagingSurf));
+-            RESET_OBJECT(hNewDesktopImage);//release it
+-            if(FAILED(hr)) {
+-                LOGE("dxgi surf NG\n");
+-                goto next;
+-            }
+-
+-            //
+-            // copy bits to user space
+-            //
+-            DXGI_MAPPED_RECT mappedRect;
+-            hr = hStagingSurf->Map(&mappedRect, DXGI_MAP_READ);
+-			//LOGI("%s %d %d\n",__func__,__LINE__,mappedRect.Pitch);
+-			
+-            if(SUCCEEDED(hr)) {
+-
+-				{
+-					if(mappedRect.Pitch != frameDescriptor.Width*4){
+-                        //LOGI("%s %d %d %d\n", __func__, __LINE__, frameDescriptor.Width, frameDescriptor.Height);
+-						for(int i=0;i<frameDescriptor.Height;i++){
+-							memcpy(&fb_buf[frameDescriptor.Width * 4*i], &(mappedRect.pBits[mappedRect.Pitch*i]), frameDescriptor.Width * 4);
+-							}
+-						}
+-					else
+-                    	memcpy(fb_buf, mappedRect.pBits, frameDescriptor.Width * frameDescriptor.Height * 4);
+-                    
+-                }
+-			
+-			//LOGI("%s %d %d %d\n",__func__,__LINE__,frameDescriptor.Width,frameDescriptor.Height);
+-
+-                hStagingSurf->Unmap();
+-            } else {
+-
+-                LOGE("dxgi map NG %x\n", hr);
+-            }
+-
+-			RESET_OBJECT(hStagingSurf);
+-            RESET_OBJECT(hAcquiredDesktopImage);
+-        next:
+-            return 0;
+-
+-}
+-
++int enc_grab_surface(std::shared_ptr<Direct3DDevice> device, ComPtr<IDXGIResource> resource,
++                     uint8_t *pixels, D3D11_TEXTURE2D_DESC *desc, IDDCX_SWAPCHAIN chain, bool& notified, HRESULT& notifyStatus) {
++    ComPtr<ID3D11Texture2D> source;
++    HRESULT hr = resource.As(&source);
++    if (FAILED(hr)) return hr;
++    source->GetDesc(desc);
++    if (desc->Width > DISP_MAX_WIDTH || desc->Height > DISP_MAX_HEIGHT ||
++        desc->SampleDesc.Count != 1 || desc->MipLevels != 1 || desc->ArraySize != 1)
++        return E_INVALIDARG;
++    auto &staging = device->Readback;
++    D3D11_TEXTURE2D_DESC cached = {};
++    if (staging) staging->GetDesc(&cached);
++    if (!staging || cached.Width != desc->Width || cached.Height != desc->Height ||
++        cached.Format != desc->Format) {
++        auto spec = *desc;
++        spec.Usage = D3D11_USAGE_STAGING;
++        spec.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++        spec.BindFlags = spec.MiscFlags = 0;
++        hr = device->Device->CreateTexture2D(&spec, nullptr, staging.ReleaseAndGetAddressOf());
++        if (FAILED(hr)) return hr;
++    }
++    device->DeviceContext->CopyResource(staging.Get(), source.Get());
++    // The desktop surface is no longer needed once its GPU copy is submitted.
++    device->DeviceContext->Flush();
++    notified = true;
++    notifyStatus = IddCxSwapChainFinishedProcessingFrame(chain);
++    if (FAILED(notifyStatus)) return notifyStatus;
++    D3D11_MAPPED_SUBRESOURCE map = {};
++    hr = device->DeviceContext->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map);
++    if (FAILED(hr)) return hr;
++    const size_t row = size_t(desc->Width) * 4;
++    if (map.RowPitch == row) memcpy(pixels, map.pData, row * desc->Height);
++    else for (UINT y = 0; y < desc->Height; ++y)
++        memcpy(pixels + y * row, static_cast<const BYTE *>(map.pData) + size_t(y)*map.RowPitch, row);
++    device->DeviceContext->Unmap(staging.Get(), 0);
++    return S_OK;
++}
+ LONG debug_level = LOG_LEVEL_INFO;
+ LONG scale_res = 320;
+ 
+--- a/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.h
++++ b/win10_idd_xfz1986_usb_graphic_driver/idd_xfz1986_usb_graphic/Driver.h
+@@ -88,6 +88,7 @@
+     Microsoft::WRL::ComPtr<IDXGIAdapter1> Adapter;
+     Microsoft::WRL::ComPtr<ID3D11Device> Device;
+     Microsoft::WRL::ComPtr<ID3D11DeviceContext> DeviceContext;
++    Microsoft::WRL::ComPtr<ID3D11Texture2D> Readback;
+ };
+ 
+ #define  UDISP_CONFIG_STR_LEN  256

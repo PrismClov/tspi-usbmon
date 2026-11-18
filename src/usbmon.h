@@ -67,6 +67,7 @@ struct um_config {
     char card[64];
     char connector[32];
     char mode[32]; /* "auto" or WxH[@R] */
+    int stretch;
     int brightness; /* -1 keeps current value */
     /* input */
     char touch[64]; /* "auto" or /dev/input/eventX */
@@ -110,6 +111,7 @@ struct um_geom {
     int *ymap;    /* dh entries */
 };
 
+int um_geom_init_mode(struct um_geom *g, int sw, int sh, int rot, int pw, int ph, int stretch);
 int um_geom_init(struct um_geom *g, int sw, int sh, int rot, int pw, int ph);
 void um_geom_fini(struct um_geom *g);
 /* Panel pixel -> stream pixel (touch), clamped into the stream rectangle. */

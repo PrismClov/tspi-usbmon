@@ -15,6 +15,7 @@
 #include "display.h"
 #include "gadget.h"
 #include "jpegdec.h"
+#include "render.h"
 #include "touch.h"
 #include "usbmon.h"
 
@@ -32,6 +33,13 @@ static uint64_t now_ms(void)
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static uint64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + ts.tv_nsec / 1000u;
 }
 
 static void usage(const char *argv0)
@@ -100,6 +108,8 @@ int main(int argc, char **argv)
     struct um_geom geom;
     struct um_display *disp = NULL;
     struct um_decoder *dec = NULL;
+    struct um_decoder *other = NULL;
+    struct um_renderer *renderer = NULL;
     struct um_decoder *splash = NULL;
     const char *config_path = "/etc/tspi-usbmon.conf";
     const char *sets[32];
@@ -168,7 +178,7 @@ int main(int argc, char **argv)
     if (cfg.brightness >= 0)
         um_display_set_brightness(cfg.brightness);
 
-    if (um_geom_init(&geom, cfg.stream_w, cfg.stream_h, cfg.rotate, panel_w, panel_h) < 0) {
+    if (um_geom_init_mode(&geom, cfg.stream_w, cfg.stream_h, cfg.rotate, panel_w, panel_h, cfg.stretch) < 0) {
         um_err("invalid geometry");
         goto out;
     }
@@ -190,38 +200,66 @@ int main(int argc, char **argv)
         goto out_gadget;
     }
 
+    um_decoder_enable_hardware(dec, 1);
+    other = um_decoder_new();
+    if (!other) goto out_touch;
+    um_decoder_enable_hardware(other, 1);
+    /* Diagnostic override permits an otherwise identical serial A/B run. */
+    const char *serial = getenv("UM_SERIAL_RENDER");
+    renderer = um_renderer_new(disp, &geom, !(serial && atoi(serial)));
+    if (!renderer) goto out_touch;
     uint64_t frames = 0, failed = 0, bytes = 0;
-    uint64_t decode_us = 0;
+    uint64_t decode_us = 0, jpeg_us = 0, compose_us = 0, flip_us = 0;
+    uint64_t overlap_us = 0, render_wait_us = 0;
     uint64_t last_stats = now_ms();
     uint64_t stat_frames = 0;
     int splash_shown = 0;
 
     while (!g_stop) {
         struct um_frame *f = um_gadget_wait_frame(200);
-
+        int decoded = 0;
+        size_t frame_bytes = 0;
+        uint64_t frame_jpeg_us = 0;
+        uint64_t decode_start = 0, decode_end = 0;
+        int received = f != NULL;
         if (f) {
-            uint64_t t0 = now_ms();
+            uint64_t t0 = now_us();
+            decode_start = t0;
+            decoded = um_decoder_decode(dec, f->data, f->len) == 0;
+            decode_end = now_us();
+            frame_jpeg_us = decode_end - t0;
+            frame_bytes = f->len;
+            if (!decoded) failed++;
+            um_gadget_release_frame(f);
+        }
 
-            if (um_decoder_decode(dec, f->data, f->len) == 0) {
-                int pitch = 0;
-                uint8_t *fb = um_display_buffer(disp, &pitch);
-
-                if (fb) {
-                    um_compose(fb, pitch, panel_w, panel_h, um_decoder_data(dec),
-                               um_decoder_width(dec), um_decoder_height(dec),
-                               um_decoder_pitch(dec), &geom);
-                    um_display_flip(disp);
-                }
+        /* Only the other decoder can be in use by RGA here. Wait after
+         * decoding, so hardware decode overlaps the preceding render. */
+        struct um_render_result result;
+        uint64_t wait_start = now_us();
+        if (um_renderer_finish(renderer, &result)) {
+            render_wait_us += now_us() - wait_start;
+            uint64_t begin = decode_start > result.start_us ? decode_start : result.start_us;
+            uint64_t end = decode_end < result.end_us ? decode_end : result.end_us;
+            if (end > begin) overlap_us += end - begin;
+            if (result.ok) {
                 frames++;
                 stat_frames++;
-                bytes += f->len;
-                decode_us += (now_ms() - t0) * 1000u;
+                bytes += result.bytes;
+                jpeg_us += result.jpeg_us;
+                compose_us += result.compose_us;
+                flip_us += result.flip_us;
+                decode_us += result.jpeg_us + result.compose_us + result.flip_us;
+            } else failed++;
+        }
+        if (decoded) {
+            if (um_renderer_submit(renderer, dec, frame_bytes, frame_jpeg_us) == 0) {
+                struct um_decoder *tmp = dec;
+                dec = other;
+                other = tmp;
                 splash_shown = 0;
-            } else {
-                failed++;
-            }
-            um_gadget_release_frame(f);
-        } else if (!um_gadget_enabled() && splash && !splash_shown) {
+            } else failed++;
+        } else if (!received && !um_gadget_enabled() && splash && !splash_shown) {
             int pitch = 0;
             uint8_t *fb = um_display_buffer(disp, &pitch);
 
@@ -250,6 +288,13 @@ int main(int argc, char **argv)
                     stat_frames ? (double)decode_us / 1000.0 / (double)stat_frames : 0.0,
                     dt ? (double)bytes / 1048576.0 * 1000.0 / (double)dt : 0.0,
                     (double)rx_bytes / 1048576.0, rx_hdr, rx_rej, rx_drop);
+            if (stat_frames)
+                um_info("timing jpeg=%.2f compose=%.2f flip=%.2f ms overlap=%.2f wait=%.2f ms",
+                        jpeg_us / (1000.0 * stat_frames), compose_us / (1000.0 * stat_frames),
+                        flip_us / (1000.0 * stat_frames), overlap_us / (1000.0 * stat_frames),
+                        render_wait_us / (1000.0 * stat_frames));
+            overlap_us = render_wait_us = 0;
+            jpeg_us = compose_us = flip_us = 0;
             last_stats = now;
             stat_frames = 0;
             bytes = 0;
@@ -260,6 +305,8 @@ int main(int argc, char **argv)
     um_info("shutting down");
     ret = 0;
 
+out_touch:
+    um_renderer_free(renderer);
     um_touch_stop();
 out_gadget:
     um_gadget_stop();
@@ -270,6 +317,8 @@ out:
         um_decoder_free(splash);
     if (dec)
         um_decoder_free(dec);
+    if (other)
+        um_decoder_free(other);
     if (disp)
         um_display_close(disp);
     return ret;

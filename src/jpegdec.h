@@ -20,5 +20,10 @@ const uint8_t *um_decoder_data(const struct um_decoder *dec);
 int um_decoder_width(const struct um_decoder *dec);
 int um_decoder_height(const struct um_decoder *dec);
 int um_decoder_pitch(const struct um_decoder *dec);
+/* Hardware output is an NV12/NV16 DMA-BUF; software remains the default. */
+void um_decoder_enable_hardware(struct um_decoder *dec, int enable);
+int um_decoder_dma_fd(const struct um_decoder *dec);
+int um_decoder_vertical_stride(const struct um_decoder *dec);
+int um_decoder_format(const struct um_decoder *dec);
 
 #endif

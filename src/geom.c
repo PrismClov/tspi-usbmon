@@ -32,6 +32,11 @@ static void inv_rotate(const struct um_geom *g, int rx, int ry, int *sx, int *sy
 
 int um_geom_init(struct um_geom *g, int sw, int sh, int rot, int pw, int ph)
 {
+    return um_geom_init_mode(g, sw, sh, rot, pw, ph, 0);
+}
+
+int um_geom_init_mode(struct um_geom *g, int sw, int sh, int rot, int pw, int ph, int stretch)
+{
     memset(g, 0, sizeof(*g));
 
     if (sw <= 0 || sh <= 0 || pw <= 0 || ph <= 0)
@@ -54,7 +59,10 @@ int um_geom_init(struct um_geom *g, int sw, int sh, int rot, int pw, int ph)
     }
 
     /* Aspect-preserving fit. */
-    if ((int64_t)pw * g->rh <= (int64_t)ph * g->rw) {
+    if (stretch) {
+        g->dw = pw;
+        g->dh = ph;
+    } else if ((int64_t)pw * g->rh <= (int64_t)ph * g->rw) {
         g->dw = pw;
         g->dh = (int)((int64_t)pw * g->rh / g->rw);
     } else {

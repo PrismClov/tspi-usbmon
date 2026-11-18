@@ -15,6 +15,10 @@ struct um_display *um_display_open(const struct um_config *cfg, int *panel_w, in
 /* Back buffer to compose into (XRGB8888). */
 uint8_t *um_display_buffer(struct um_display *d, int *pitch);
 /* Queue a page flip and wait for the previous one to complete. */
+int um_display_compose(struct um_display *d, const uint8_t *src,
+                       int sw, int sh, int sp, const struct um_geom *g);
+int um_display_compose_dma(struct um_display *d, int fd, int stride, int vstride,
+                          int format, const struct um_geom *g);
 int um_display_flip(struct um_display *d);
 void um_display_close(struct um_display *d);
 

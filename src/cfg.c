@@ -116,6 +116,8 @@ int um_config_set(struct um_config *cfg, const char *kv)
         snprintf(cfg->connector, sizeof(cfg->connector), "%s", val);
     } else if (!strcmp(key, "mode")) {
         snprintf(cfg->mode, sizeof(cfg->mode), "%s", val);
+    } else if (!strcmp(key, "stretch")) {
+        cfg->stretch = atoi(val) != 0;
     } else if (!strcmp(key, "brightness")) {
         int v = atoi(val);
 

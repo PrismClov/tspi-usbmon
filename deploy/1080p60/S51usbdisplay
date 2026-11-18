@@ -1,0 +1,107 @@
+#!/bin/sh
+#
+# 泰山派 Buildroot：把 ffs.udisp 并入启动时已有的 adb gadget，
+# 让板子以「USB 副屏 + adb」复合设备身份出现（VID:PID 303a:2986）。
+#
+# 这块 Rockchip 4.19 内核带 android_usb，启动后无法再新建 gadget，
+# 只能复用 S50usbdevice 建的 rockchip gadget，因此这里是「改配置 + 重新绑定」。
+#
+# 失败会回退成只有 adb 的原状，保证还能连上板子。
+#
+G=/sys/kernel/config/usb_gadget/rockchip
+FFS=/dev/ffs-udisp
+DAEMON=/usr/bin/tspi-usbmon
+CONF=/etc/tspi-usbmon.conf
+LOG=/var/log/tspi-usbdisplay.log
+READY=/tmp/tspi-usbmon.ready
+
+log() { echo "$(date '+%H:%M:%S') $*" >> $LOG; }
+
+bind_composite() {
+    # Close FunctionFS endpoints before touching UDC. On this vendor kernel
+    # unbind can wait for endpoint users, including adbd, to release them.
+    touch /tmp/tspi-usbdisplay-managed
+    killall -9 tspi-usbmon 2>/dev/null
+    killall adbd 2>/dev/null
+    sleep 1
+    UDC=$(cat $G/UDC 2>/dev/null)
+    [ -n "$UDC" ] || UDC=fcc00000.dwc3
+    touch /tmp/tspi-usbdisplay-managed
+    [ -z "$(cat $G/UDC 2>/dev/null)" ] || echo "" > $G/UDC
+    sleep 1
+
+    killall adbd 2>/dev/null
+    sleep 1
+    mkdir -p $G/functions/ffs.udisp
+    # 显示 function 放第一位，保证主机侧 vendor 接口是 interface 0
+    rm -f $G/configs/b.1/f1 $G/configs/b.1/f2
+    ln -s $G/functions/ffs.udisp $G/configs/b.1/f1
+    ln -s $G/functions/ffs.adb    $G/configs/b.1/f2
+    echo 0x303a > $G/idVendor
+    echo 0x2986 > $G/idProduct
+    echo tspi_R1920x1080_Ejpg7_Fps60_Bl4096 > $G/strings/0x409/product
+    echo udisp_adb > $G/configs/b.1/strings/0x409/configuration
+
+    mkdir -p $FFS
+
+
+    pidof tspi-usbmon >/dev/null 2>&1 && kill $(pidof tspi-usbmon)
+    sleep 2
+    umount $FFS 2>/dev/null
+    mount -t functionfs udisp $FFS || return 1
+    rm -f $READY
+    if [ -x $DAEMON ]; then
+        nohup $DAEMON --config $CONF >> /var/log/tspi-usbmon.log 2>&1 </dev/null &
+        i=0
+        while [ $i -lt 30 ] && [ ! -f $READY ]; do sleep 0.2; i=$((i+1)); done
+    fi
+
+    mountpoint -q /dev/usb-ffs/adb || mount -t functionfs adb /dev/usb-ffs/adb
+    pidof adbd >/dev/null 2>&1 || start-stop-daemon --start --quiet --background --exec /usr/bin/adbd
+    sleep 2
+
+    if [ -f "$READY" ] && pidof tspi-usbmon >/dev/null 2>&1; then
+        echo "$UDC" > $G/UDC
+    else
+        log "display descriptors not ready; falling back to adb-only"
+    fi
+    sleep 1
+    if [ "$(cat $G/UDC 2>/dev/null)" = "$UDC" ]; then
+        log "composite bound (udisp + adb, 303a:2986)"
+        return 0
+    fi
+
+    log "composite bind failed, falling back to adb-only"
+    touch /tmp/tspi-usbdisplay-managed
+    echo "" > $G/UDC
+    rm -f $G/configs/b.1/f1 $G/configs/b.1/f2
+    ln -s $G/functions/ffs.adb $G/configs/b.1/f1
+    pidof adbd >/dev/null 2>&1 || start-stop-daemon --start --quiet --background --exec /usr/bin/adbd
+    sleep 1
+    echo "$UDC" > $G/UDC
+    return 1
+}
+
+case "$1" in
+start)
+    log "=== start"
+    pidof adbd >/dev/null 2>&1 || start-stop-daemon --start --quiet --background --exec /usr/bin/adbd
+    bind_composite
+    ;;
+stop)
+    log "=== stop"
+    pidof tspi-usbmon >/dev/null 2>&1 && kill $(pidof tspi-usbmon)
+    UDC=$(cat $G/UDC 2>/dev/null)
+    touch /tmp/tspi-usbdisplay-managed
+    echo "" > $G/UDC
+    rm -f $G/configs/b.1/f1 $G/configs/b.1/f2
+    ln -s $G/functions/ffs.adb $G/configs/b.1/f1
+    pidof adbd >/dev/null 2>&1 || start-stop-daemon --start --quiet --background --exec /usr/bin/adbd
+    sleep 1
+    [ -n "$UDC" ] && echo "$UDC" > $G/UDC
+    ;;
+*)
+    echo "usage: $0 {start|stop}"
+    exit 1
+    ;;
+esac

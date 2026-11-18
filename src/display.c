@@ -1,5 +1,5 @@
 /*
- * DRM/KMS output on the MIPI-DSI panel (double buffered, page flipped).
+ * DRM/KMS output on the MIPI-DSI panel (triple buffered, page flipped).
  * SPDX-License-Identifier: MIT
  */
 #define _GNU_SOURCE
@@ -17,8 +17,12 @@
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#ifdef UM_USE_RGA
+#include <RgaApi.h>
+#endif
 
 struct dbuf {
+    int dma_fd;
     uint32_t fb;
     uint32_t handle;
     uint32_t pitch;
@@ -32,10 +36,12 @@ struct um_display {
     uint32_t conn;
     drmModeModeInfo mode;
     int w, h;
-    struct dbuf buf[2];
-    int back;
+    struct dbuf buf[3];
+    int front, render, pending;
     int flip_done;
     int use_flip;
+    int rga_ready;
+    int rga_initialized;
     /* state saved at open so we can hand the CRTC back cleanly on exit */
     int saved_valid;
     drmModeCrtc *saved_crtc;
@@ -247,7 +253,9 @@ static int set_crtc_any(struct um_display *d, drmModeRes *res, uint32_t preferre
 
 static void destroy_buffers(struct um_display *d)
 {
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
+        if (d->buf[i].dma_fd >= 0)
+            close(d->buf[i].dma_fd);
         if (d->buf[i].fb)
             drmModeRmFB(d->fd, d->buf[i].fb);
         if (d->buf[i].map && d->buf[i].map != MAP_FAILED)
@@ -263,7 +271,7 @@ static void destroy_buffers(struct um_display *d)
 
 static int create_buffers(struct um_display *d)
 {
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         struct drm_mode_create_dumb create = {0};
         struct drm_mode_map_dumb map = {0};
 
@@ -298,6 +306,10 @@ static int create_buffers(struct um_display *d)
             return -1;
         }
         memset(d->buf[i].map, 0, create.size);
+#ifdef UM_USE_RGA
+        if (drmPrimeHandleToFD(d->fd, create.handle, DRM_CLOEXEC | DRM_RDWR, &d->buf[i].dma_fd) < 0)
+            d->buf[i].dma_fd = -1;
+#endif
     }
     return 0;
 }
@@ -312,6 +324,9 @@ struct um_display *um_display_open(const struct um_config *cfg, int *panel_w, in
     if (!d)
         return NULL;
     d->fd = -1;
+    d->buf[0].dma_fd = d->buf[1].dma_fd = d->buf[2].dma_fd = -1;
+    d->render = 1;
+    d->pending = -1;
 
     for (int i = 0; i < 2 && d->fd < 0; i++) {
         d->fd = open(cards[i], O_RDWR | O_CLOEXEC);
@@ -367,6 +382,12 @@ struct um_display *um_display_open(const struct um_config *cfg, int *panel_w, in
     drmModeFreeConnector(conn);
     drmModeFreeResources(res);
 
+#ifdef UM_USE_RGA
+    if (d->buf[0].dma_fd >= 0 && d->buf[1].dma_fd >= 0 && d->buf[2].dma_fd >= 0 && c_RkRgaInit() == 0) {
+        d->rga_ready = d->rga_initialized = 1;
+        um_info("RGA hardware composition enabled");
+    }
+#endif
     *panel_w = d->w;
     *panel_h = d->h;
     return d;
@@ -384,47 +405,105 @@ uint8_t *um_display_buffer(struct um_display *d, int *pitch)
 {
     if (!d)
         return NULL;
-    *pitch = (int)d->buf[1 - d->back].pitch;
-    return d->buf[1 - d->back].map;
+    *pitch = (int)d->buf[d->render].pitch;
+    return d->buf[d->render].map;
+}
+
+int um_display_compose_dma(struct um_display *d, int fd, int stride, int vstride,
+                          int format, const struct um_geom *g)
+{
+#ifdef UM_USE_RGA
+    if (d->rga_ready && fd >= 0 && (format == 0 || format == 2)) {
+        struct dbuf *b = &d->buf[d->render];
+        rga_info_t source = {0}, dest = {0};
+        source.fd = fd;
+        source.mmuFlag = 1;
+        source.rotation = g->rot == 90 ? HAL_TRANSFORM_ROT_90 :
+                          g->rot == 180 ? HAL_TRANSFORM_ROT_180 :
+                          g->rot == 270 ? HAL_TRANSFORM_ROT_270 : 0;
+        rga_set_rect(&source.rect, 0, 0, g->sw, g->sh, stride, vstride,
+                     format == 0 ? RK_FORMAT_YCbCr_420_SP : RK_FORMAT_YCbCr_422_SP);
+        dest.fd = b->dma_fd;
+        dest.mmuFlag = 1;
+        dest.color_space_mode = yuv2rgb_mode1; /* JPEG full-range BT.601 */
+        rga_set_rect(&dest.rect, g->dx, g->dy, g->dw, g->dh,
+                     b->pitch / 4, d->h, RK_FORMAT_BGRA_8888);
+        return c_RkRgaBlit(&source, &dest, NULL);
+    }
+#else
+    (void)d; (void)fd; (void)stride; (void)vstride; (void)format; (void)g;
+#endif
+    return -1;
+}
+
+int um_display_compose(struct um_display *d, const uint8_t *src,
+                       int sw, int sh, int sp, const struct um_geom *g)
+{
+    struct dbuf *b = &d->buf[d->render];
+#ifdef UM_USE_RGA
+    if (d->rga_ready) {
+        rga_info_t source = {0}, dest = {0};
+        source.fd = -1;
+        source.virAddr = (void *)src;
+        source.mmuFlag = 1;
+        source.rotation = g->rot == 90 ? HAL_TRANSFORM_ROT_90 :
+                          g->rot == 180 ? HAL_TRANSFORM_ROT_180 :
+                          g->rot == 270 ? HAL_TRANSFORM_ROT_270 : 0;
+        rga_set_rect(&source.rect, 0, 0, g->sw, g->sh, sp / 4, sh, RK_FORMAT_BGRA_8888);
+        dest.fd = b->dma_fd;
+        dest.mmuFlag = 1;
+        rga_set_rect(&dest.rect, g->dx, g->dy, g->dw, g->dh,
+                     b->pitch / 4, d->h, RK_FORMAT_BGRA_8888);
+        if (c_RkRgaBlit(&source, &dest, NULL) == 0)
+            return 0;
+        um_warn("RGA composition failed; using CPU fallback");
+        d->rga_ready = 0;
+    }
+#endif
+    um_compose(b->map, b->pitch, d->w, d->h, src, sw, sh, sp, g);
+    return 0;
 }
 
 int um_display_flip(struct um_display *d)
 {
-    int ret;
-    int target = 1 - d->back;
-
-    if (!d)
-        return -1;
-
+    if (!d) return -1;
+    int target = d->render;
     if (d->use_flip) {
         drmEventContext ev = {
             .version = DRM_EVENT_CONTEXT_VERSION,
             .page_flip_handler = flip_handler,
         };
         struct pollfd pfd = {.fd = d->fd, .events = POLLIN};
-
-        d->flip_done = 0;
-        ret = drmModePageFlip(d->fd, d->crtc, d->buf[target].fb, DRM_MODE_PAGE_FLIP_EVENT, d);
-        if (ret == 0) {
+        /* Three distinct buffers: scanning, pending, and being composed.
+         * Decode/compose may overlap the previous vblank, but never overwrite
+         * either a scanning or queued framebuffer. */
+        if (d->pending >= 0) {
             for (int waited = 0; waited < 100 && !d->flip_done; waited += 5) {
                 if (poll(&pfd, 1, 5) > 0)
                     drmHandleEvent(d->fd, &ev);
             }
-            d->back = target;
+            if (!d->flip_done) {
+                um_warn("page flip completion timeout; retaining buffer ownership");
+                return -1;
+            }
+            d->front = d->pending;
+            d->pending = -1;
+        }
+        d->flip_done = 0;
+        if (drmModePageFlip(d->fd, d->crtc, d->buf[target].fb,
+                            DRM_MODE_PAGE_FLIP_EVENT, d) == 0) {
+            d->pending = target;
+            for (int i = 0; i < 3; i++)
+                if (i != d->front && i != d->pending) { d->render = i; break; }
             return 0;
         }
         um_warn("page flip failed (%s), falling back to SetCrtc", strerror(errno));
         d->use_flip = 0;
     }
-
-    if (drmModeSetCrtc(d->fd, d->crtc, d->buf[target].fb, 0, 0, &d->conn, 1, &d->mode) < 0) {
-        static unsigned failures;
-
-        if (failures++ % 100 == 0)
-            um_err("SetCrtc flip failed (%u): %s", failures, strerror(errno));
+    if (drmModeSetCrtc(d->fd, d->crtc, d->buf[target].fb, 0, 0, &d->conn, 1, &d->mode) < 0)
         return -1;
-    }
-    d->back = target;
+    d->front = target;
+    d->render = (target + 1) % 3;
     return 0;
 }
 
@@ -450,6 +529,9 @@ void um_display_close(struct um_display *d)
         drmDropMaster(d->fd);
         close(d->fd);
     }
+#ifdef UM_USE_RGA
+    if (d->rga_initialized) c_RkRgaDeInit();
+#endif
     free(d);
 }
 

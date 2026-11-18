@@ -91,3 +91,11 @@ Windows 10/11 会自动把 HID 数字转换器当作触摸屏。第一次使用�
 ## 6. 多屏
 
 驱动支持多个同类设备，但每个设备需要独立的 USB 口和供电；多块屏之间不能拼接成一个大桌面。
+
+## 7. 1080p 提前通知驱动
+
+在上游源码 chuanjinpang/win10_idd_xfz1986_usb_graphic_driver_display 的提交
+`c2de0f56f778904d663d8e2dc5a71b4a6b270ecc` 上应用本目录的
+`early-notify.patch`（在上游仓库根目录执行 `git apply <补丁路径>`）。
+补丁复用 staging 纹理，在提交 GPU 复制后通知 IddCx，再回读和编码。
+诊断级别 4 的 FRAME 日志关联 Windows 帧号和协议中的 10 位帧号。

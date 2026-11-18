@@ -1,0 +1,111 @@
+--- a/src/display.c
++++ b/src/display.c
+@@ -38,7 +38,7 @@
+     int w, h;
+     struct dbuf buf[3];
+     int front, render, pending;
+-    int flip_done;
++    int flip_done, pending_wire;
+     int use_flip;
+     int rga_ready;
+     int rga_initialized;
+@@ -107,6 +107,7 @@
+     (void)seq;
+     (void)sec;
+     (void)usec;
++    if(d->pending_wire>=0) um_info("PRESENT %d %u %u %u",d->pending_wire,seq,sec,usec);
+     d->flip_done = 1;
+ }
+ 
+@@ -464,7 +465,8 @@
+     return 0;
+ }
+ 
+-int um_display_flip(struct um_display *d)
++int um_display_flip(struct um_display *d){return um_display_flip_tagged(d,-1);}
++int um_display_flip_tagged(struct um_display *d,int wire)
+ {
+     if (!d) return -1;
+     int target = d->render;
+@@ -492,7 +494,7 @@
+         d->flip_done = 0;
+         if (drmModePageFlip(d->fd, d->crtc, d->buf[target].fb,
+                             DRM_MODE_PAGE_FLIP_EVENT, d) == 0) {
+-            d->pending = target;
++            d->pending_wire=wire; d->pending = target;
+             for (int i = 0; i < 3; i++)
+                 if (i != d->front && i != d->pending) { d->render = i; break; }
+             return 0;
+--- a/src/display.h
++++ b/src/display.h
+@@ -19,6 +19,7 @@
+                        int sw, int sh, int sp, const struct um_geom *g);
+ int um_display_compose_dma(struct um_display *d, int fd, int stride, int vstride,
+                           int format, const struct um_geom *g);
++int um_display_flip_tagged(struct um_display *d,int wire);
+ int um_display_flip(struct um_display *d);
+ void um_display_close(struct um_display *d);
+ 
+--- a/src/main.c
++++ b/src/main.c
+@@ -222,6 +222,7 @@
+         uint64_t frame_jpeg_us = 0;
+         uint64_t decode_start = 0, decode_end = 0;
+         int received = f != NULL;
++        int wire = f ? f->id : -1;
+         if (f) {
+             uint64_t t0 = now_us();
+             decode_start = t0;
+@@ -253,7 +254,7 @@
+             } else failed++;
+         }
+         if (decoded) {
+-            if (um_renderer_submit(renderer, dec, frame_bytes, frame_jpeg_us) == 0) {
++            if (um_renderer_submit(renderer, dec, frame_bytes, frame_jpeg_us,wire) == 0) {
+                 struct um_decoder *tmp = dec;
+                 dec = other;
+                 other = tmp;
+--- a/src/render.c
++++ b/src/render.c
+@@ -15,6 +15,7 @@
+     pthread_t thread;
+     pthread_mutex_t lock;
+     pthread_cond_t cond;
++    int wire;
+     int threaded, state, stop; /* 0 idle, 1 submitted, 2 complete */
+ };
+ 
+@@ -47,7 +48,7 @@
+     }
+     uint64_t composed = clock_us();
+     r->result.compose_us = composed - start;
+-    r->result.ok = status == 0 && um_display_flip(r->display) == 0;
++    r->result.ok = status == 0 && um_display_flip_tagged(r->display,r->wire) == 0;
+     r->result.flip_us = clock_us() - composed;
+     r->result.end_us = clock_us();
+ }
+@@ -88,11 +89,11 @@
+     return r;
+ }
+ 
+-int um_renderer_submit(struct um_renderer *r, struct um_decoder *d, size_t bytes, uint64_t jpeg_us)
++int um_renderer_submit(struct um_renderer *r, struct um_decoder *d, size_t bytes, uint64_t jpeg_us,int wire)
+ {
+     pthread_mutex_lock(&r->lock);
+     if (r->state || r->stop) { pthread_mutex_unlock(&r->lock); return -1; }
+-    r->decoder = d;
++    r->wire=wire; r->decoder = d;
+     r->result = (struct um_render_result){.bytes = bytes, .jpeg_us = jpeg_us};
+     r->state = 1;
+     if (r->threaded) pthread_cond_broadcast(&r->cond);
+--- a/src/render.h
++++ b/src/render.h
+@@ -15,7 +15,7 @@
+ };
+ /* One outstanding job. Decoder belongs to renderer until finish returns. */
+ struct um_renderer *um_renderer_new(struct um_display *, const struct um_geom *, int threaded);
+-int um_renderer_submit(struct um_renderer *, struct um_decoder *, size_t bytes, uint64_t jpeg_us);
++int um_renderer_submit(struct um_renderer *, struct um_decoder *, size_t bytes, uint64_t jpeg_us,int wire);
+ int um_renderer_finish(struct um_renderer *, struct um_render_result *);
+ void um_renderer_free(struct um_renderer *);
+ #endif
